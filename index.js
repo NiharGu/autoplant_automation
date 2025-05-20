@@ -1,56 +1,68 @@
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys')
+import baileys from '@whiskeysockets/baileys';
+import qrcode from 'qrcode-terminal';
+import pino from 'pino';
 
-const pino = require('pino')
-const qrcode = require('qrcode-terminal')
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason
+} = baileys;
+
+const logger = pino({ level: 'info' }, pino.destination('./messages.log'));
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
-  const { version } = await fetchLatestBaileysVersion()
-  console.log('📱 Using WhatsApp version:', version)
+  const { state, saveCreds } = await useMultiFileAuthState('auth');
+  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
     auth: state,
-    logger: pino({ level: 'silent' }), // 👈 you can change 'silent' to 'info' if you want logs
-  })
-
-  sock.ev.on('creds.update', saveCreds)
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    browser: ['Ubuntu', 'Firefox', '22.04.4']
+  });
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update
+    const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log('📸 Scan this QR code:')
-      qrcode.generate(qr, { small: true })
+      console.log('\n📱 Scan this QR code with your WhatsApp:\n');
+      qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'close') {
       const shouldReconnect =
-        (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
-      console.log('🔌 Connection closed. Reconnecting:', shouldReconnect)
-      if (shouldReconnect) startBot()
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('🛑 Connection closed. Reconnecting:', shouldReconnect);
+      if (shouldReconnect) startBot();
     } else if (connection === 'open') {
-      console.log('✅ WhatsApp connection established')
+      console.log('✅ Connected to WhatsApp!');
     }
-  })
+  });
+
+  sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg.message) return
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe || !msg.key.remoteJid.endsWith('@g.us')) continue;
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text
-    const sender = msg.key.remoteJid
-    console.log(`📥 Message from ${sender}: ${text}`)
+      const metadata = await sock.groupMetadata(msg.key.remoteJid);
+      const groupName = metadata.subject.toLowerCase();
 
-    if (text === 'hi') {
-      await sock.sendMessage(sender, { text: 'Hello there! 👋' })
+      if (groupName === 'test') {
+        const sender = msg.key.participant;
+        const messageText =
+          msg.message.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          '[non-text message]';
+
+        const logMsg = `👥 [${metadata.subject}] ${sender}: ${messageText}`;
+        logger.info(logMsg);
+        console.log(logMsg);
+      }
     }
-  })
+  });
 }
 
-startBot()
+startBot();
