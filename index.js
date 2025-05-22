@@ -3,6 +3,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import Pino from 'pino';
 import { Boom } from '@hapi/boom';
+import crypto from 'crypto';
+
+// Polyfill for crypto if needed
+if (typeof globalThis.crypto === 'undefined') {
+  globalThis.crypto = crypto;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
