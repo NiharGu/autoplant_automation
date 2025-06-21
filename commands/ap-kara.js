@@ -57,7 +57,7 @@ function extractDataFromMessage(messageText) {
     // Extract weight (number followed by MT)
     const weightMatch = messageText.match(dataPatterns.weight);
     if (weightMatch) {
-        result.weight = weightMatch[0];
+        result.weight = weightMatch[1];
     }
 
     // Extract destination (string before weight in same line)
