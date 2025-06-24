@@ -1,10 +1,23 @@
 // Ap Kara Command Handler for Baileys Bot
 // Extracts data from replied message using pattern matching
+import axios from 'axios';
+import express from 'express';
+
+// Create Express server to receive messages from Python
+const app = express();
+app.use(express.json());
+
+// Store the WhatsApp socket globally so we can use it in routes
+let globalSock = null;
+
+// Store message contexts for replies
+const messageContexts = new Map();
+
 
 // Pattern definitions for data extraction
 const dataPatterns = {
     // Vehicle number: xx11xx1111 format (2 letters, 2 digits, 2 letters, 4 digits)
-    vehicleNumber: /\b[A-Za-z]{2}\d{2}[A-Za-z]{2}\d{4}\b/,
+    vehicleNumber: /\b[A-Za-z]{2}\d{1,2}[A-Za-z]{1,2}\d{3,4}\b/,
     
     // SO Number: 10-digit number starting with 2200
     soNumber: /\b2200\d{6}\b/,
@@ -127,14 +140,14 @@ function extractDataByLines(messageText) {
         if (!result.weight) {
             const weightMatch = line.match(dataPatterns.weight);
             if (weightMatch) {
-                result.weight = weightMatch[0];
+                result.weight = weightMatch[1]; // Extract just the number, not the full match
             }
         }
 
         // Weight and destination from same line
         const weightMatch = line.match(dataPatterns.weight);
         if (weightMatch && !result.weight) {
-            result.weight = weightMatch[0];
+            result.weight = weightMatch[1]; // Fixed: Extract just the number
             
             // Extract destination from the same line (everything before the weight)
             if (!result.destination) {
@@ -213,9 +226,313 @@ function extractDriverInfo(messageText) {
     return result;
 }
 
-// Main Ap Kara handler
+// Modified function to send data to Python with callback info and handle success/error responses
+async function sendToPython(finalData, chatId, originalMessage) {
+    try {
+        const pythonData = {
+            driver_name: finalData.driver_name || null,
+            driver_license: finalData.driver_license || null,
+            vehicle_num: finalData.vehicle_num || null,
+            destination: finalData.destination || null,
+            weight: finalData.weight || null,
+            so_no: finalData.so_no || null,
+            phone_num: finalData.phone_num || null,
+            chat_id: chatId, // Send chat ID so Python knows where to reply
+            message_key: originalMessage.key // Send message key for replies
+        };
+
+        // Store message context for replies
+        messageContexts.set(chatId, {
+            messageKey: originalMessage.key,
+            originalMessage: originalMessage,
+            timestamp: Date.now()
+        });
+
+        console.log(`💾 Stored message context for ${chatId}:`, originalMessage.key);
+
+        console.log('Sending data to Python...', JSON.stringify(pythonData, null, 2));
+        
+        const response = await axios.post('http://localhost:5000/process-data', pythonData, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 300000  // 30 seconds timeout
+        });
+
+        console.log('✅ Python response:', response.data);
+
+        // Handle successful response from Python
+        if (response.data && response.data.status === 'success') {
+            // Send success message as reply to the original ap kara message
+            if (globalSock && chatId) {
+                let successMessage = '✅ *Processing Completed Successfully!*\n\n';
+                successMessage += '📋 *Processed Data:*\n';
+                
+                const processedData = response.data.processed_data;
+                if (processedData) {
+                    if (processedData.driver_name) {
+                        successMessage += `👤 Driver Name: ${processedData.driver_name}\n`;
+                    }
+                    if (processedData.driver_license) {
+                        successMessage += `🆔 License: ${processedData.driver_license}\n`;
+                    }
+                    if (processedData.vehicle_num) {
+                        successMessage += `🚛 Vehicle: ${processedData.vehicle_num}\n`;
+                    }
+                    if (processedData.destination) {
+                        successMessage += `📍 Destination: ${processedData.destination}\n`;
+                    }
+                    if (processedData.weight) {
+                        successMessage += `⚖️ Weight: ${processedData.weight} MT\n`;
+                    }
+                    if (processedData.so_no) {
+                        successMessage += `📋 SO Number: ${processedData.so_no}\n`;
+                    }
+                    if (processedData.phone_num) {
+                        successMessage += `📞 Phone: ${processedData.phone_num}\n`;
+                    }
+                }
+                
+                successMessage += '\n🎉 All processes executed successfully!';
+
+                await globalSock.sendMessage(chatId, { 
+                    text: successMessage
+                }, { 
+                    quoted: originalMessage
+                });
+                
+                console.log('✅ Success message sent to WhatsApp');
+            }
+        }
+
+        return response.data;
+
+    } catch (error) {
+        console.error('❌ Error sending to Python:', {
+            message: error.message,
+            response: error.response?.data,
+            status: error.response?.status
+        });
+        
+        // Handle error responses from Python
+        if (globalSock && chatId) {
+            let errorMessage = '❌ *Processing Failed*\n\n';
+            
+            // Check if it's a structured error response from Python
+            if (error.response?.data?.status === 'error') {
+                errorMessage += `*Error:* ${error.response.data.message}`;
+            } else {
+                // Generic error handling
+                const genericError = error.response?.data?.message || 
+                                   error.response?.message || 
+                                   error.message || 
+                                   'An unexpected error occurred while processing your request.';
+                errorMessage += `*Error:* ${genericError}`;
+            }
+            
+            errorMessage += '\n\n🔄 Please try again or contact support if the issue persists.';
+            
+            await globalSock.sendMessage(chatId, { 
+                text: errorMessage
+            }, { 
+                quoted: originalMessage
+            });
+            
+            console.log('❌ Error message sent to WhatsApp');
+        }
+        
+        return null;
+    }
+}
+
+// MODIFIED: Route to receive messages from Python with reply functionality
+app.post('/send-message', async (req, res) => {
+    try {
+        const { chat_id, message, message_type = 'text', reply_to_original = false } = req.body;
+        
+        if (!chat_id || !message) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'chat_id and message are required' 
+            });
+        }
+
+        if (!globalSock) {
+            return res.status(500).json({ 
+                success: false, 
+                error: 'WhatsApp socket not available' 
+            });
+        }
+
+        // Prepare message payload
+        let messagePayload;
+        
+        if (message_type === 'text') {
+            messagePayload = { text: message };
+        } else if (message_type === 'image') {
+            // Handle image messages if needed
+            messagePayload = { 
+                image: { url: message.url }, 
+                caption: message.caption || '' 
+            };
+        }
+
+        // Add reply context if requested and available
+        if (reply_to_original) {
+            const messageContext = messageContexts.get(chat_id);
+            if (messageContext && messageContext.messageKey) {
+                messagePayload.quoted = messageContext.messageKey;
+                console.log(`📎 Adding reply context for ${chat_id}:`, messageContext.messageKey);
+            } else {
+                console.log(`⚠️ No message context found for ${chat_id} or missing messageKey`);
+            }
+        }
+
+        await globalSock.sendMessage(chat_id, messagePayload);
+        
+        console.log(`✅ Message sent to ${chat_id}${reply_to_original ? ' (as reply)' : ''}: ${message}`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Message sent successfully' 
+        });
+
+    } catch (error) {
+        console.error('❌ Error sending message from Python:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// MODIFIED: Route for Python to send status updates with reply functionality
+app.post('/send-status', async (req, res) => {
+    try {
+        const { chat_id, status, data, reply_to_original = true } = req.body;
+        
+        if (!chat_id || !status) {
+            return res.status(400).json({ 
+                success: false, 
+                error: 'chat_id and status are required' 
+            });
+        }
+
+        if (!globalSock) {
+            return res.status(500).json({ 
+                success: false, 
+                error: 'WhatsApp socket not available' 
+            });
+        }
+
+        let statusMessage = '';
+        
+        switch (status) {
+            case 'processing':
+                statusMessage = '⏳ Processing your data...';
+                break;
+            case 'completed':
+                statusMessage = '✅ Processing completed successfully!';
+                if (data && data.result) {
+                    statusMessage += `\n\n📊 *Result:*\n${data.result}`;
+                }
+                break;
+            case 'error':
+                statusMessage = '❌ An error occurred during processing';
+                if (data && data.error) {
+                    statusMessage += `\n\n*Error:* ${data.error}`;
+                }
+                break;
+            case 'custom':
+                statusMessage = data && data.message ? data.message : 'Status update';
+                break;
+            default:
+                statusMessage = `📋 Status: ${status}`;
+        }
+
+        // Prepare message payload
+        let messagePayload = { text: statusMessage };
+
+        // Add reply context if requested and available
+        if (reply_to_original) {
+            const messageContext = messageContexts.get(chat_id);
+            if (messageContext && messageContext.messageKey) {
+                messagePayload.quoted = messageContext.messageKey;
+                console.log(`📎 Adding reply context for ${chat_id}:`, messageContext.messageKey);
+            } else {
+                console.log(`⚠️ No message context found for ${chat_id} or missing messageKey`);
+            }
+        }
+
+        await globalSock.sendMessage(chat_id, messagePayload);
+        
+        console.log(`✅ Status sent to ${chat_id}${reply_to_original ? ' (as reply)' : ''}: ${status}`);
+        
+        // Clean up old message contexts (older than 1 hour)
+        const oneHourAgo = Date.now() - (60 * 60 * 1000);
+        for (const [key, context] of messageContexts.entries()) {
+            if (context.timestamp < oneHourAgo) {
+                messageContexts.delete(key);
+            }
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Status sent successfully' 
+        });
+
+    } catch (error) {
+        console.error('❌ Error sending status from Python:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// NEW: Route to clear message context (optional cleanup)
+app.post('/clear-context', async (req, res) => {
+    try {
+        const { chat_id } = req.body;
+        
+        if (chat_id) {
+            messageContexts.delete(chat_id);
+            console.log(`🧹 Cleared message context for ${chat_id}`);
+        } else {
+            messageContexts.clear();
+            console.log('🧹 Cleared all message contexts');
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Context cleared successfully' 
+        });
+
+    } catch (error) {
+        console.error('❌ Error clearing context:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+});
+
+// Main Ap Kara handler (modified to store message context for replies)
 async function handleApKaraCommand(sock, message) {
     try {
+        const chatId = message.key.remoteJid;
+        const messageKey = message.key;
+        
+        // Store the original message for reply context
+        messageContexts.set(chatId, {
+            messageKey: messageKey,
+            originalMessage: message.message,
+            timestamp: Date.now()
+        });
+        
+        // Send initial processing message
+        await sock.sendMessage(chatId, {
+            text: "⏳ Processing your request... This may take up to 5 minutes."
+        });
+
         // Get message text directly from the current message (not quoted)
         let messageText = '';
         if (message.message.conversation) {
@@ -225,8 +542,9 @@ async function handleApKaraCommand(sock, message) {
         }
 
         if (!messageText) {
-            await sock.sendMessage(message.key.remoteJid, {
-                text: "❌ Could not extract text from the message"
+            await sock.sendMessage(chatId, {
+                text: "❌ Could not extract text from the message",
+                quoted: message
             });
             return;
         }
@@ -247,8 +565,9 @@ async function handleApKaraCommand(sock, message) {
             const quotedMessage = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
             if (!quotedMessage) {
-                await sock.sendMessage(message.key.remoteJid, {
-                    text: "❌ Please reply to a message with 'ap kara' command"
+                await sock.sendMessage(chatId, {
+                    text: "❌ Please reply to a message with 'ap kara' command",
+                    quoted: message
                 });
                 return;
             }
@@ -262,8 +581,9 @@ async function handleApKaraCommand(sock, message) {
             }
 
             if (!quotedText) {
-                await sock.sendMessage(message.key.remoteJid, {
-                    text: "❌ Could not extract text from the original message"
+                await sock.sendMessage(chatId, {
+                    text: "❌ Could not extract text from the original message",
+                    quoted: message
                 });
                 return;
             }
@@ -305,8 +625,9 @@ async function handleApKaraCommand(sock, message) {
             const quotedMessage = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
 
             if (!quotedMessage) {
-                await sock.sendMessage(message.key.remoteJid, {
-                    text: "❌ Please reply to a message or use 'ap kara' with driver info"
+                await sock.sendMessage(chatId, {
+                    text: "❌ Please reply to a message or use 'ap kara' with driver info",
+                    quoted: message
                 });
                 return;
             }
@@ -320,8 +641,9 @@ async function handleApKaraCommand(sock, message) {
             }
 
             if (!quotedText) {
-                await sock.sendMessage(message.key.remoteJid, {
-                    text: "❌ Could not extract text from the replied message"
+                await sock.sendMessage(chatId, {
+                    text: "❌ Could not extract text from the replied message",
+                    quoted: message
                 });
                 return;
             }
@@ -366,9 +688,12 @@ async function handleApKaraCommand(sock, message) {
         console.log('Original Message:', messageText);
 
         // Send response
-        await sock.sendMessage(message.key.remoteJid, {
+        await sock.sendMessage(chatId, {
             text: response
         });
+
+        // Send data to Python with chat ID and message key for replies
+        await sendToPython(finalData, chatId, message);
 
         // Return extracted data for further processing
         return finalData;
@@ -376,13 +701,25 @@ async function handleApKaraCommand(sock, message) {
     } catch (error) {
         console.error('Error in Ap Kara command:', error);
         await sock.sendMessage(message.key.remoteJid, {
-            text: "❌ Error processing the command"
+            text: "❌ Error processing the command",
+            quoted: message
         });
     }
 }
 
-// Command setup listener
+// Command setup listener (modified to store socket globally)
 export function setupApKaraCommand(sock) {
+    // Store socket globally so we can use it in Express routes
+    globalSock = sock;
+    
+    // Start Express server to receive messages from Python
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`🚀 Express server listening on port ${PORT}`);
+        console.log(`📡 Ready to receive messages from Python at http://localhost:${PORT}/send-message`);
+        console.log(`📡 Ready to receive status updates from Python at http://localhost:${PORT}/send-status`);
+    });
+    
     sock.ev.on('messages.upsert', async (m) => {
         const message = m.messages[0];
         
@@ -412,5 +749,6 @@ export {
     extractDataFromMessage,
     extractDataByLines,
     extractDriverInfo,
-    dataPatterns
+    dataPatterns,
+    sendToPython
 };
