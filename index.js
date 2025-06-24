@@ -89,65 +89,81 @@ async function startBot() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    const msg = messages[0];
-    if (!msg.message || msg.key.fromMe) return;
+  if (type !== 'notify') return;
+  const msg = messages[0];
+  if (!msg.message || msg.key.fromMe) return;
 
-    const senderJid = msg.key.remoteJid;
+  const senderJid = msg.key.remoteJid;
 
-    // Only group chats
-    if (!senderJid.endsWith('@g.us')) return;
+  // Only group chats
+  if (!senderJid.endsWith('@g.us')) return;
 
-    try {
-      const groupMetadata = await sock.groupMetadata(senderJid);
-      const groupName = groupMetadata.subject;
+  try {
+    const groupMetadata = await sock.groupMetadata(senderJid);
+    const groupName = groupMetadata.subject;
 
-      if (groupName !== "Test") return;
+    if (groupName !== "Test") return;
 
-      const participant = msg.key.participant;
+    const participant = msg.key.participant;
 
-      const formatPhoneNumber = (jid) => {
-        if (!jid) return 'unknown';
-        const numberPart = jid.split('@')[0];
-        return numberPart.replace(/\D/g, '');
-      };
+    const formatPhoneNumber = (jid) => {
+      if (!jid) return 'unknown';
+      const numberPart = jid.split('@')[0];
+      return numberPart.replace(/\D/g, '');
+    };
 
-      const senderNumber = participant
-        ? formatPhoneNumber(participant)
-        : formatPhoneNumber(senderJid);
+    const senderNumber = participant
+      ? formatPhoneNumber(participant)
+      : formatPhoneNumber(senderJid);
 
-      const sender = groupMetadata.participants.find(p => p.id === participant);
-      const senderName = sender?.name || 'Unknown';
+    const sender = groupMetadata.participants.find(p => p.id === participant);
+    const senderName = sender?.name || 'Unknown';
 
-      const textMessage =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        msg.message.videoMessage?.caption;
+    const textMessage =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      msg.message.imageMessage?.caption ||
+      msg.message.videoMessage?.caption;
 
-      if (textMessage) {
-        const logMessage = `📱 Message from ${senderName} (${senderNumber}): ${textMessage}`;
-        console.log(logMessage);
+    if (textMessage) {
+      const logMessage = `📱 Message from ${senderName} (${senderNumber}): ${textMessage}`;
+      console.log(logMessage);
 
-        if (textMessage.toLowerCase().startsWith('!echo ')) {
-          const response = textMessage.slice(6);
-          await sock.sendMessage(senderJid, { text: response });
-          console.log(`✅ Replied with: ${response}`);
+      // !hi command (replying with quote using 3rd arg)
+      if (textMessage.toLowerCase().startsWith('!hi')) {
+        const name = textMessage.slice(3).trim();
+        let response;
+        if (name.length > 0) {
+          response = `Hi ${name} 👋`;
+        } else {
+          response = 'Hi 👋';
         }
+        await sock.sendMessage(senderJid, { text: response }, { quoted: msg });
+        console.log(`✅ Replied to !hi with quote: "${response}"`);
+      }
 
-        else if (textMessage.toLowerCase() === '!help') {
-          const helpText = `Available commands:
+      else if (textMessage.toLowerCase().startsWith('!echo ')) {
+        const response = textMessage.slice(6);
+        await sock.sendMessage(senderJid, { text: response });
+        console.log(`✅ Replied with: ${response}`);
+      }
+
+      else if (textMessage.toLowerCase() === '!help') {
+        const helpText = `Available commands:
+- !hi [name] - Greet with a reply (quotes your message)
 - !echo [message] - Echo back your message
 - !help - Show this help message`;
 
-          await sock.sendMessage(senderJid, { text: helpText });
-          console.log('✅ Sent help message');
-        }
+        await sock.sendMessage(senderJid, { text: helpText });
+        console.log('✅ Sent help message');
       }
-    } catch (error) {
-      logger.error(`Error processing message: ${error.message}`);
     }
-  });
+  } catch (error) {
+    logger.error(`Error processing message: ${error.message}`);
+  }
+}
+
+);
 }
 
 // Error handling
